@@ -78,6 +78,11 @@ def crawl(seed_urls: list[str], max_pages: int | None = MAX_PAGES) -> None:
         pages_crawled += 1
         print(f"\n[CRAWL]   ({pages_crawled}) {url}")
 
+        # Notify frontier that this domain has one more crawled page.
+        # This sinks the domain lower in priority so less-crawled domains
+        # get picked next.
+        frontier.mark_crawled(url)
+
         # ── Step 2: Extract links ─────────────────────────────────────────────
         links = extract_links(html, base_url=url)
 
@@ -96,6 +101,10 @@ def crawl(seed_urls: list[str], max_pages: int | None = MAX_PAGES) -> None:
 
     print(f"\n[SUMMARY] Pages crawled: {pages_crawled} | "
           f"Unique URLs seen: {frontier.seen_count()}")
+
+    print("\n[DOMAIN STATS] Pages crawled per domain:")
+    for domain, count in frontier.domain_stats().items():
+        print(f"  {domain:<45} {count} page(s)")
 
 
 if __name__ == "__main__":
