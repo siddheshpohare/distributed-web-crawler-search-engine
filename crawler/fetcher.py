@@ -17,8 +17,9 @@ DEFAULT_TIMEOUT = 10.0
 
 # User-Agent sent with every request so servers know who we are.
 USER_AGENT = (
-    "DistributedCrawlerBot/0.1 "
-    "(educational project; +https://github.com/you/your-repo)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 

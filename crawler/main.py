@@ -30,7 +30,8 @@ from parser import extract_links
 # Starting URLs — change these to whatever you want to crawl.
 SEED_URLS: list[str] = [
     "https://core-stack.org",
-    
+    "https://www.india.gov.in",
+
 ]
 
 # Maximum number of pages to crawl before stopping.
@@ -66,16 +67,16 @@ def crawl(seed_urls: list[str], max_pages: int | None = MAX_PAGES) -> None:
             break
 
         url = frontier.next()
-        print(f"\n[CRAWL]   ({pages_crawled + 1}) {url}")
 
         # ── Step 1: Fetch HTML ────────────────────────────────────────────────
         html = fetch(url)
 
         if html is None:
-            print(f"[SKIP]    Failed to fetch — skipping.")
+            print(f"\n[SKIP]    {url} — failed to fetch, moving on.")
             continue
 
         pages_crawled += 1
+        print(f"\n[CRAWL]   ({pages_crawled}) {url}")
 
         # ── Step 2: Extract links ─────────────────────────────────────────────
         links = extract_links(html, base_url=url)
