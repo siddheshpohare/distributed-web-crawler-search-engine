@@ -2,26 +2,44 @@
 frontier.py — Domain-Priority URL Frontier (Phase 1 - Updated)
 
 Instead of a plain FIFO queue, this frontier uses a min-heap keyed
-by per-domain crawl count.  The domain with the fewest pages crawled
-is always picked next, ensuring fair interleaving across multiple
-seed domains.
+by per-domain *virtual* crawl count.  The domain with the lowest
+virtual count is always picked next, giving fair interleaving across
+multiple seed domains while avoiding the "Dormant Flow Burst" problem.
+
+──────────────────────────────────────────────────────────────────────
+The Dormant Flow Burst problem (and why we need virtual time)
+──────────────────────────────────────────────────────────────────────
+If we key the heap on *lifetime* crawl counts, a domain that was
+dormant (had no URLs) while other domains advanced will re-enter the
+heap with a stale, very low count and monopolise the scheduler until
+it "catches up" — exactly the starvation that CFS fixed in the Linux
+kernel by anchoring virtual runtime to the current heap minimum.
+
+Fix: when a domain is (re-)pushed onto the heap its key is clamped to:
+
+    max(domain_own_count, current_heap_minimum)
+
+A reactivating domain gets ONE turn of priority (it lands at the
+floor) but not dozens — its key is never below where the slowest
+active domain already sits.
 
 Internal structure:
   _domain_queues  : dict[domain -> deque[url]]   per-domain FIFO queue
   _domain_counts  : dict[domain -> int]          pages crawled per domain
-  _heap           : min-heap[(crawl_count, domain)]  one entry per domain
-                    that currently has pending URLs
-  _seen           : set[url]                     global deduplication
+  _heap           : min-heap[(virtual_count, insertion_order, domain)]
+  _in_heap        : set[str]                     dedup guard for heap
+  _seen           : set[url]                     global URL deduplication
 
 How next() works:
-  1. Pop the domain with the lowest crawl count from the heap.
+  1. Pop the domain with the lowest virtual count from the heap.
   2. Take the next URL from that domain's deque (FIFO within domain).
-  3. If the domain still has more URLs, re-push it with its current count.
+  3. If the domain still has pending URLs, re-push it with its *real*
+     current count (no clamping needed — it was just active).
   4. Return the URL.
 
 How mark_crawled() works:
   Called by main.py after a page is successfully fetched.
-  Increments the domain's crawl count so it sinks lower in priority
+  Increments the domain's crawl count so it sinks in priority
   relative to less-crawled domains.
 
 In later phases this will be replaced by a Redis-backed queue
@@ -40,10 +58,13 @@ def _domain(url: str) -> str:
 
 class Frontier:
     """
-    Domain-priority URL frontier.
+    Domain-priority URL frontier with virtual-time anti-starvation.
 
-    Always crawls next from the domain with the fewest pages crawled,
-    giving fair interleaving when multiple seed domains are present.
+    Always crawls next from the domain with the lowest *virtual* crawl
+    count.  When a dormant domain reactivates, its heap key is clamped
+    to ``max(own_count, current_heap_minimum)`` so it cannot consume
+    dozens of consecutive turns at the expense of active domains
+    (the "Dormant Flow Burst" / sleeping-process starvation problem).
 
     Attributes
     ----------
@@ -52,7 +73,7 @@ class Frontier:
     _domain_counts : defaultdict[str, int]
         Number of pages successfully crawled per domain.
     _heap : list[tuple[int, int, str]]
-        Min-heap entries of (crawl_count, insertion_order, domain).
+        Min-heap entries of (virtual_count, insertion_order, domain).
         insertion_order breaks ties so equal-count domains alternate
         in the order they first appeared.
     _in_heap : set[str]
@@ -61,6 +82,10 @@ class Frontier:
         Every URL ever added — used for O(1) deduplication.
     _insertion_order : dict[str, int]
         Stable tiebreaker: the order in which each domain first appeared.
+    _global_min_count : int
+        The virtual-time floor — the heap key of the domain most recently
+        popped.  New/reactivated domains are clamped to this value so
+        they cannot burst backwards through the queue.
     """
 
     def __init__(self) -> None:
@@ -71,17 +96,36 @@ class Frontier:
         self._seen: set[str] = set()
         self._insertion_order: dict[str, int] = {}
         self._domain_counter: int = 0  # monotonic counter for new domains
+        # Virtual-time floor: updated each time next() pops a domain.
+        # New/dormant domains are clamped to this so they cannot burst
+        # backwards and monopolise the crawler (Dormant Flow Burst fix).
+        self._global_min_count: int = 0
 
     def _push_domain(self, domain: str) -> None:
-        """Push a domain onto the heap if it is not already there."""
+        """Push a domain onto the heap using a clamped virtual count.
+
+        The heap key is ``max(own_count, _global_min_count)`` — the
+        virtual-time floor.  This ensures:
+
+        1. A domain that was dormant while others advanced re-enters the
+           heap at the floor (gets ONE priority slot), not 88 turns behind.
+        2. A domain that is actively crawling gets pushed with its real
+           count, which is already >= the floor, so clamping is a no-op.
+
+        This is the Dormant Flow Burst fix, analogous to how CFS clamps
+        a waking task's vruntime to ``min_vruntime`` before inserting it
+        into the red-black tree.
+        """
         if domain not in self._in_heap:
             order = self._insertion_order.setdefault(domain, self._domain_counter)
             if order == self._domain_counter:
                 self._domain_counter += 1
-            heapq.heappush(
-                self._heap,
-                (self._domain_counts[domain], order, domain),
+
+            # Clamp: never push below the current floor.
+            virtual_count = max(
+                self._domain_counts[domain], self._global_min_count
             )
+            heapq.heappush(self._heap, (virtual_count, order, domain))
             self._in_heap.add(domain)
 
     def add(self, url: str) -> bool:
@@ -89,8 +133,8 @@ class Frontier:
         Add a URL to the frontier if it has not been seen before.
 
         The URL is placed into its domain's FIFO queue.  The domain is
-        pushed onto the min-heap keyed by current crawl count so domains
-        with fewer crawls are preferred.
+        pushed onto the min-heap with a virtual count clamped to the
+        global floor so dormant domains cannot burst ahead of active ones.
 
         Parameters
         ----------
@@ -115,8 +159,16 @@ class Frontier:
         """
         Return the next URL to crawl.
 
-        Selects the domain with the lowest crawl count (highest priority).
-        If multiple domains share the same count, the one that was seen
+        Selects the domain with the lowest virtual count.  Applies a
+        second clamp at pop time to handle any stale heap entries that
+        were enqueued *before* the floor advanced (e.g. a seed URL pushed
+        at time=0 that lay dormant while other domains crawled ahead).
+
+        After dispatching a URL, advances the floor to the effective
+        virtual count so it only ever moves forward.  The domain is
+        re-pushed with a fresh clamped key for its remaining URLs.
+
+        If multiple domains share the same effective count the one seen
         first is chosen (stable insertion-order tiebreaker).
 
         Returns
@@ -125,18 +177,28 @@ class Frontier:
             The next URL, or None if the frontier is empty.
         """
         while self._heap:
-            _count, _order, domain = heapq.heappop(self._heap)
+            raw_count, _order, domain = heapq.heappop(self._heap)
             self._in_heap.discard(domain)
+
+            # Pop-time clamp: correct any stale entries that slipped in
+            # before the floor advanced (belt-and-suspenders with _push_domain).
+            effective_count = max(raw_count, self._global_min_count)
+
+            # Advance the floor — it only ever moves forward.
+            # The +1 tick represents "one scheduling quantum consumed".
+            # Without this, a domain clamped to floor=N would be re-pushed at N
+            # every turn, permanently beating active domains whose count > N.
+            self._global_min_count = effective_count + 1
 
             queue = self._domain_queues.get(domain)
             if not queue:
-                # Domain exhausted its URLs — skip.
+                # Domain exhausted its URLs — discard stale heap entry.
                 continue
 
             url = queue.popleft()
 
-            # If the domain still has pending URLs, re-push it with the
-            # latest crawl count so its position reflects new information.
+            # Re-push: _push_domain will clamp the key to the (now updated)
+            # floor, so this domain cannot jump back to the front of the heap.
             if queue:
                 self._push_domain(domain)
 
