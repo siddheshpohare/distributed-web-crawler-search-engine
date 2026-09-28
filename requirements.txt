@@ -1,0 +1,15 @@
+# requirements.txt — Phase 2 Dependencies
+#
+# Install all dependencies:
+#   pip install -r requirements.txt
+#
+# Phase 1 dependencies
+httpx            # HTTP client used by crawler/fetcher.py
+beautifulsoup4   # HTML parser used by crawler/parser.py
+
+# Phase 2 dependencies
+fastapi          # Web framework — routing, request validation, OpenAPI docs
+uvicorn[standard]  # ASGI server to run FastAPI
+sqlalchemy       # ORM + SQL toolkit
+psycopg2-binary  # PostgreSQL driver (binary wheel — no system libs needed)
+pydantic         # Request / response validation (bundled with FastAPI, listed for clarity)

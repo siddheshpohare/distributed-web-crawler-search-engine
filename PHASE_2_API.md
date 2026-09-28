@@ -11,7 +11,7 @@ store every crawled page as a durable record instead of printing to stdout.
 
 ---
 
-## What We Are Adding
+## What Was Built
 
 ```
 Phase 1                          Phase 2
@@ -22,27 +22,31 @@ hardcoded SEED_URLS        →     POST /crawl  (trigger via API)
 no query capability        →     GET  /search, GET /pages
 ```
 
+**Status: ✅ Complete**
+
 ---
 
-## New Folder Structure
+## Folder Structure
 
 ```
 .
 ├── api/
-│   ├── main.py          ← FastAPI app, mounts all routers
+│   ├── main.py          ← FastAPI app, mounts all routers, auto-creates tables on startup
+│   ├── schemas.py       ← Pydantic request/response models
 │   ├── routes/
-│   │   ├── crawl.py     ← POST /crawl, GET /crawl/status
-│   │   ├── pages.py     ← GET /pages, GET /pages/{id}
+│   │   ├── crawl.py     ← POST /api/v1/crawl, GET /api/v1/crawl/status
+│   │   ├── pages.py     ← GET /api/v1/pages, GET /api/v1/pages/{id}
 │   │   └── health.py    ← GET /health
-│   ├── db/
-│   │   ├── session.py   ← SQLAlchemy engine + session factory
-│   │   └── models.py    ← ORM models (Page table)
-│   └── schemas.py       ← Pydantic request/response models
-├── crawler/             ← Phase 1 code (unchanged)
+│   └── db/
+│       ├── session.py   ← SQLAlchemy engine + session factory (get_db dependency)
+│       └── models.py    ← ORM models (Page table)
+├── crawler/             ← Phase 1 code (unchanged — imported as-is)
 │   ├── main.py
 │   ├── fetcher.py
 │   ├── parser.py
 │   └── frontier.py
+├── requirements.txt     ← All dependencies (Phase 1 + Phase 2)
+├── setup_db.sql         ← Manual SQL for DB/table creation
 └── PHASE_2_API.md
 ```
 
@@ -66,7 +70,20 @@ no query capability        →     GET  /search, GET /pages
 { "seed_urls": ["https://example.com"], "max_pages": 50 }
 
 // Response
-{ "message": "Crawl started", "seed_count": 1, "max_pages": 50 }
+{ "message": "Crawl completed", "seed_count": 1, "max_pages": 50, "pages_crawled": 42 }
+```
+
+**GET /api/v1/crawl/status**
+```json
+{
+  "pages_crawled": 42,
+  "pages_failed": 3,
+  "queue_size": 112,
+  "unique_urls_seen": 305,
+  "domain_breakdown": {
+    "example.com": 42
+  }
+}
 ```
 
 **GET /api/v1/pages**
@@ -78,7 +95,7 @@ no query capability        →     GET  /search, GET /pages
     "title": "Example Domain",
     "http_status": 200,
     "crawl_status": "success",
-    "crawled_at": "2026-09-27T09:00:00Z"
+    "crawled_at": "2026-09-28T09:00:00Z"
   }
 ]
 ```
@@ -98,67 +115,101 @@ CREATE TABLE pages (
 );
 ```
 
-Every successful fetch writes one row. Failed/skipped URLs are also
-recorded (so we know what was attempted).
+Every crawl attempt writes one row. Failed URLs are also recorded (with
+`crawl_status = 'failed'`) so we know what was attempted. Re-crawling a URL
+updates the existing row via `INSERT … ON CONFLICT DO UPDATE` (upsert).
 
 ---
 
-## Step-by-Step Build Plan
+## How to Run
 
-### Step 1 — Set up FastAPI skeleton
-- `pip install fastapi uvicorn`
-- Create `api/main.py` with a bare FastAPI app
-- Add `/health` endpoint
-- Confirm `uvicorn api.main:app --reload` works
+```bash
+# 1. Install all dependencies
+pip install -r requirements.txt
 
-### Step 2 — Connect PostgreSQL
-- `pip install sqlalchemy psycopg2-binary`
-- Create `api/db/session.py` — engine + `SessionLocal`
-- Create `api/db/models.py` — `Page` ORM model
-- Run `CREATE TABLE pages …` (manual SQL for now, migrations in Phase 3)
-- Confirm a test insert/select works
+# 2. Create the PostgreSQL database
+psql -U postgres -c "CREATE DATABASE crawlerdb;"
 
-### Step 3 — Wire crawler into a POST /crawl route
-- Move the Phase 1 crawl loop into a callable function
-- After each successful fetch, write a row to `pages` via SQLAlchemy
-- Call that function from the `POST /crawl` handler
-- For now, run the crawl **synchronously** (blocks the request) — async
-  background tasks come in Phase 3
+# 3. Set the connection string
+# Windows PowerShell:
+$env:DATABASE_URL = "postgresql://postgres:YOUR_PASSWORD@localhost:5432/crawlerdb"
+# macOS/Linux:
+export DATABASE_URL="postgresql://postgres:YOUR_PASSWORD@localhost:5432/crawlerdb"
 
-### Step 4 — Build GET /pages and GET /pages/{id}
-- Query the `pages` table
-- Return results as JSON using Pydantic schemas
-- Add simple pagination (`?skip=0&limit=20`)
+# 4. Start the server (tables are auto-created on startup)
+uvicorn api.main:app --reload
 
-### Step 5 — Build GET /crawl/status
-- Return live stats: pages crawled, queue size, domain breakdown
-- Read from the frontier object (in-memory for now)
+# 5. Open Swagger UI
+# http://127.0.0.1:8000/docs
+```
 
-### Step 6 — Pydantic schemas
-- `CrawlRequest` — validates `seed_urls` and `max_pages`
-- `PageResponse` — shapes what the API returns for a page
-- `StatusResponse` — shapes the crawl status response
+---
 
-### Step 7 — Test everything manually
-- Use the FastAPI auto-docs at `/docs` (Swagger UI)
-- Hit each endpoint, verify DB rows appear
+## Step-by-Step Build Record
+
+### Step 1 — FastAPI skeleton ✅
+- Created `api/main.py` with a bare FastAPI app using `lifespan` context
+- Added `/health` endpoint in `api/routes/health.py`
+- `uvicorn api.main:app --reload` starts the server
+
+### Step 2 — Connect PostgreSQL ✅
+- Created `api/db/session.py` — engine + `SessionLocal` + `get_db()` FastAPI dependency
+- Created `api/db/models.py` — `Page` ORM model (SQLAlchemy 2.x `Mapped` style)
+- `Base.metadata.create_all()` on app startup auto-creates the table (no manual SQL needed for dev)
+
+### Step 3 — Wire crawler into POST /crawl ✅
+- Phase 1 crawl loop refactored into `routes/crawl.py`
+- After each fetch: `_upsert_page()` writes/updates a row via `INSERT … ON CONFLICT DO UPDATE`
+- Crawl runs **synchronously** (blocks the HTTP request) — background tasks in Phase 3
+
+### Step 4 — GET /pages and GET /pages/{id} ✅
+- `api/routes/pages.py` queries the `pages` table
+- Results serialized via `PageResponse` Pydantic schema (`from_attributes=True`)
+- Pagination via `?skip=0&limit=20` query params
+
+### Step 5 — GET /crawl/status ✅
+- Returns stats from the last crawl's in-memory frontier snapshot
+- Fields: `pages_crawled`, `pages_failed`, `queue_size`, `unique_urls_seen`, `domain_breakdown`
+
+### Step 6 — Pydantic schemas ✅
+- `CrawlRequest` — validates `seed_urls` (must be valid HTTP/HTTPS URLs) and `max_pages` (1–500)
+- `CrawlResponse` — summary returned after crawl completes
+- `PageResponse` — single page record (ORM-compatible via `from_attributes=True`)
+- `StatusResponse` — crawl statistics
+
+### Step 7 — Manual testing ✅
+- FastAPI auto-docs at `/docs` (Swagger UI) — hit each endpoint interactively
+- Verified DB rows appear after POST /crawl
 
 ---
 
 ## New Dependencies
 
 ```
-fastapi          ← web framework
-uvicorn          ← ASGI server
-sqlalchemy       ← ORM + query builder
-psycopg2-binary  ← PostgreSQL driver
-pydantic         ← request/response validation (included with FastAPI)
+fastapi           ← web framework
+uvicorn           ← ASGI server
+sqlalchemy        ← ORM + query builder
+psycopg2-binary   ← PostgreSQL driver
+pydantic          ← request/response validation (included with FastAPI)
 ```
 
 Install:
 ```bash
-pip install fastapi uvicorn sqlalchemy psycopg2-binary
+pip install -r requirements.txt
 ```
+
+---
+
+## Design Decisions Made in Phase 2
+
+| Decision | Rationale |
+|---|---|
+| **Synchronous crawl** | POST /crawl blocks until done. Intentional: understand crawl → DB pipeline before introducing Celery/Redis background tasks (Phase 3) |
+| **Upsert on conflict** | `INSERT … ON CONFLICT DO UPDATE` makes crawling idempotent. Re-crawling a URL updates the row instead of raising a unique-constraint error |
+| **`create_all()` on startup** | Zero-config for development. Alembic migrations replace this from Phase 3 onward |
+| **Module-level frontier snapshot** | `_last_frontier` stores the last crawl's state for `/status`. Simple in-process state is sufficient for Phase 2; Redis replaces it in Phase 3 |
+| **Phase 1 code untouched** | `fetcher.fetch`, `frontier.Frontier`, `parser.extract_links` are imported as-is. Phase 2 adds a new layer without modifying the existing one |
+| **`from_attributes=True`** | Enables Pydantic to read directly from SQLAlchemy ORM row objects without manual conversion |
 
 ---
 
@@ -167,14 +218,16 @@ pip install fastapi uvicorn sqlalchemy psycopg2-binary
 | Concept | Where |
 |---|---|
 | REST API design (routes, methods, status codes) | `api/routes/` |
-| Request validation | Pydantic schemas |
-| Response serialization | Pydantic schemas |
-| ORM (Object-Relational Mapping) | SQLAlchemy models |
-| Database session management | `db/session.py` |
-| SQL — INSERT, SELECT, WHERE, LIMIT | `routes/pages.py` |
+| Request validation | Pydantic schemas (`CrawlRequest`) |
+| Response serialization | Pydantic schemas (`PageResponse`, `StatusResponse`) |
+| ORM (Object-Relational Mapping) | SQLAlchemy `Page` model |
+| Database session management | `db/session.py` — `get_db()` dependency |
+| SQL — INSERT, SELECT, WHERE, LIMIT, ON CONFLICT | `routes/crawl.py`, `routes/pages.py` |
 | Pagination | `GET /pages?skip=&limit=` |
+| Upsert / idempotent writes | `INSERT … ON CONFLICT DO UPDATE` |
 | Separating concerns (routes / db / schemas) | Folder structure |
-| Auto-generated API docs | FastAPI `/docs` |
+| Auto-generated API docs | FastAPI `/docs` (Swagger UI) |
+| Lifespan context (startup/shutdown hooks) | `api/main.py` |
 
 ---
 
